@@ -1,0 +1,17 @@
+{
+  "name": "mchat",
+  "version": "2.0.0",
+  "description": "MChat — AI chat with a built-in browser, powered by Groq (openai/gpt-oss-120b)",
+  "main": "api/chat.js",
+  "scripts": {
+    "dev": "vercel dev",
+    "build": "echo 'No build step required'",
+    "start": "vercel dev"
+  },
+  "keywords": ["ai", "chat", "groq", "gpt-oss", "browser", "streaming"],
+  "author": "mattmamaevigor",
+  "license": "MIT",
+  "engines": { "node": "18.x" },
+  "dependencies": {},
+  "devDependencies": { "vercel": "latest" }
+}
