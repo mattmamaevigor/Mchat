@@ -11,7 +11,7 @@
   "keywords": ["ai", "chat", "groq", "gpt-oss", "browser", "streaming"],
   "author": "mattmamaevigor",
   "license": "MIT",
-  "engines": { "node": "18.x" },
+  "engines": { "node": "24.x" },
   "dependencies": {},
   "devDependencies": { "vercel": "latest" }
 }
