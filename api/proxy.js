@@ -7,6 +7,13 @@
  * only govern requests made *by a browser rendering that page*, and
  * here the page is never rendered as a page — it's fetched as data.
  *
+ * NOTE: this does NOT bypass network-level blocks (Cloudflare/WAF
+ * banning datacenter IPs, TLS-fingerprint bot detection, DNS
+ * failures). Those show up as a generic "fetch failed" from Node's
+ * fetch (undici) because the real reason lives in `error.cause` and
+ * was previously being swallowed. This version surfaces that cause
+ * so failures are actually diagnosable per-site.
+ *
  * Response shape (consumed by index.html's loadBrowserPage()):
  *   { error, url, contentType, status, size, content, metadata, cached }
  * ════════════════════════════════════════════════════════════════
@@ -108,6 +115,20 @@ class URLValidator {
 // ═══════════════════════════════════════════════════════════
 
 class ContentProcessor {
+  // Turns Node/undici's generic "fetch failed" into something diagnosable
+  // by pulling the real reason out of error.cause (DNS, TLS, connection
+  // reset, etc). Cloudflare/WAF-style blocks of datacenter IPs usually
+  // surface here as ECONNRESET or "other side closed" — that specific
+  // signature means the target is actively rejecting server-side fetches
+  // and no amount of header-spoofing from this proxy will fix it; the
+  // "Open in real browser" fallback is the correct answer for those sites.
+  static describeFetchError(error) {
+    const cause = error?.cause;
+    const causeMsg = cause?.message || cause?.code || (cause ? String(cause) : null);
+    if (causeMsg) return `${error.message} (${causeMsg})`;
+    return error.message;
+  }
+
   static async fetchContent(targetUrl, redirectCount = 0) {
     if (redirectCount > CONFIG.MAX_REDIRECTS) throw new Error('Too many redirects');
 
@@ -121,7 +142,12 @@ class ContentProcessor {
         headers: {
           'User-Agent': CONFIG.USER_AGENT,
           Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9',
+          'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+          'Accept-Encoding': 'gzip, deflate, br',
+          'Sec-Fetch-Dest': 'document',
+          'Sec-Fetch-Mode': 'navigate',
+          'Sec-Fetch-Site': 'none',
+          'Upgrade-Insecure-Requests': '1',
         },
         signal: controller.signal,
       });
@@ -152,8 +178,8 @@ class ContentProcessor {
       };
     } catch (error) {
       clearTimeout(timeoutId);
-      if (error.name === 'AbortError') throw new Error('Request timed out');
-      throw error;
+      if (error.name === 'AbortError') throw new Error('Request timed out (15s) — site may be slow or unreachable from Vercel');
+      throw new Error(this.describeFetchError(error));
     }
   }
 
@@ -242,7 +268,14 @@ async function handler(req, res) {
       return;
     }
 
-    const fetched = await ContentProcessor.fetchContent(targetURL);
+    let fetched;
+    try {
+      fetched = await ContentProcessor.fetchContent(targetURL);
+    } catch (fetchError) {
+      Logger.error('Proxy fetch failed', { url: targetURL, error: fetchError.message });
+      ResponseWriter.sendError(res, fetchError.message, 502);
+      return;
+    }
 
     let metadata = null;
     let content = fetched.content;
