@@ -1,21 +1,25 @@
 /**
  * ════════════════════════════════════════════════════════════════
- * MChat Proxy — fetches a page server-side, strips scripts/styles,
- * returns sanitizable HTML + metadata so the browser panel can render
- * it as plain DOM instead of an <iframe>. This is what avoids CSP /
- * X-Frame-Options blocking entirely: the target site's CSP headers
- * only govern requests made *by a browser rendering that page*, and
- * here the page is never rendered as a page — it's fetched as data.
+ * MChat Proxy — fetches a page server-side and returns sanitized
+ * HTML + metadata for the browser panel, which renders it inside a
+ * sandboxed <iframe srcdoc="..."> (no allow-scripts). This is what
+ * avoids CSP / X-Frame-Options blocking entirely: the target site's
+ * CSP headers only govern requests made *by a browser rendering that
+ * page*, and here the page is never rendered as a page — it's
+ * fetched as data, then handed to an isolated iframe document.
  *
- * NOTE: this does NOT bypass network-level blocks (Cloudflare/WAF
- * banning datacenter IPs, TLS-fingerprint bot detection, DNS
- * failures). Those show up as a generic "fetch failed" from Node's
- * fetch (undici) because the real reason lives in `error.cause` and
- * was previously being swallowed. This version surfaces that cause
- * so failures are actually diagnosable per-site.
+ * <style> tags are KEPT (not stripped) — the frontend renders inside
+ * a sandboxed iframe, so the target page's CSS is fully isolated and
+ * can't collide with MChat's own styles. Stripping it was what made
+ * pages like Google render as unstyled black circles instead of icons.
+ *
+ * <script> tags, inline on*= handlers, and javascript: URLs are still
+ * stripped as defense-in-depth, even though the iframe sandbox (no
+ * allow-scripts) already blocks execution on its own.
  *
  * Response shape (consumed by index.html's loadBrowserPage()):
- *   { error, url, contentType, status, size, content, metadata, cached }
+ *   { error, url, contentType, status, size, content, metadata,
+ *     charset, cached }
  * ════════════════════════════════════════════════════════════════
  */
 
@@ -29,6 +33,9 @@ const CONFIG = {
   MAX_REDIRECTS: 5,
   ALLOWED_PROTOCOLS: ['http:', 'https:'],
   USER_AGENT: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  MAX_HTML_RETURNED: 150000,
+  // Best-effort only (resets on cold start) — see RateLimiter note below.
+  REQUESTS_PER_MINUTE: 40,
 };
 
 // ═══════════════════════════════════════════════════════════
@@ -54,6 +61,31 @@ class CacheManager {
 }
 
 const cache = new CacheManager();
+
+// ═══════════════════════════════════════════════════════════
+// RATE LIMITER (best-effort — see api/chat.js for the same pattern)
+// ═══════════════════════════════════════════════════════════
+//
+// Resets on cold start / new serverless instance, so this is not a
+// hard global limit. It exists to give a friendly message instead of
+// hammering the target site (and this function's own timeout budget)
+// during a burst of clicks from the same tab.
+
+class RateLimiter {
+  constructor() { this.requests = []; }
+
+  isAllowed(clientId) {
+    const now = Date.now();
+    const cutoff = now - 60000;
+    this.requests = this.requests.filter(r => r.time > cutoff);
+    const mine = this.requests.filter(r => r.clientId === clientId);
+    if (mine.length >= CONFIG.REQUESTS_PER_MINUTE) return false;
+    this.requests.push({ clientId, time: now });
+    return true;
+  }
+}
+
+const rateLimiter = new RateLimiter();
 
 // ═══════════════════════════════════════════════════════════
 // LOGGER
@@ -107,6 +139,55 @@ class URLValidator {
     if (this.isBlockedHost(url.hostname)) throw new Error('Requests to local/private addresses are not allowed');
 
     return url;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// CHARSET DETECTION & DECODING
+// ═══════════════════════════════════════════════════════════
+//
+// The old version always did Buffer.toString('utf-8'), which silently
+// mangles any page served in windows-1251, koi8-r, iso-8859-1, etc —
+// still common on older/regional (including many .ru) sites. We sniff
+// the real encoding the same way a browser does: Content-Type header
+// first, then a <meta charset> / <meta http-equiv content=...charset=...>
+// look inside the raw bytes, falling back to utf-8.
+
+class CharsetResolver {
+  static fromContentType(contentType) {
+    const m = /charset=([^;]+)/i.exec(contentType || '');
+    return m ? m[1].trim().replace(/["']/g, '').toLowerCase() : null;
+  }
+
+  static fromHtmlBytes(buffer) {
+    // Charset declarations always live in the first ~1KB of well-formed
+    // HTML, and are always ASCII-safe there — latin1 is a safe enough
+    // lens to read them regardless of the real encoding.
+    const head = buffer.subarray(0, 2048).toString('latin1');
+    let m = /<meta[^>]+charset\s*=\s*["']?([a-zA-Z0-9_-]+)/i.exec(head);
+    if (m) return m[1].toLowerCase();
+    m = /<meta[^>]+http-equiv=["']content-type["'][^>]*content=["'][^"']*charset=([a-zA-Z0-9_-]+)/i.exec(head);
+    if (m) return m[1].toLowerCase();
+    return null;
+  }
+
+  static normalize(charset) {
+    if (!charset) return 'utf-8';
+    const c = charset.toLowerCase();
+    // A handful of common aliases TextDecoder doesn't always accept as-is.
+    const aliases = { 'win-1251': 'windows-1251', 'cp1251': 'windows-1251', 'cp-1251': 'windows-1251', 'win1251': 'windows-1251' };
+    return aliases[c] || c;
+  }
+
+  static decode(buffer, contentType) {
+    const declared = this.normalize(this.fromContentType(contentType) || this.fromHtmlBytes(buffer));
+    try {
+      return { text: new TextDecoder(declared, { fatal: false }).decode(buffer), charset: declared };
+    } catch {
+      // Unknown/unsupported label (TextDecoder throws RangeError) — fall
+      // back to utf-8 rather than failing the whole page load.
+      return { text: new TextDecoder('utf-8', { fatal: false }).decode(buffer), charset: 'utf-8 (fallback)' };
+    }
   }
 }
 
@@ -165,14 +246,23 @@ class ContentProcessor {
         throw new Error(`Content too large: ${contentLength} bytes`);
       }
 
-      const buffer = await response.arrayBuffer();
+      const arrayBuffer = await response.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
       if (buffer.byteLength > CONFIG.MAX_CONTENT_SIZE) {
         throw new Error(`Content too large: ${buffer.byteLength} bytes`);
       }
 
+      const contentType = response.headers.get('content-type') || '';
+      const isText = contentType.includes('text/') || contentType.includes('xml') || contentType.includes('json') || contentType === '';
+      const { text, charset } = isText
+        ? CharsetResolver.decode(buffer, contentType)
+        : { text: '', charset: null };
+
       return {
-        content: Buffer.from(buffer).toString('utf-8'),
-        contentType: response.headers.get('content-type') || '',
+        content: text,
+        raw: buffer,
+        contentType,
+        charset,
         status: response.status,
         url: response.url,
       };
@@ -200,13 +290,23 @@ class ContentProcessor {
     return metadata;
   }
 
+  // <style> is intentionally KEPT — see header comment. Everything that
+  // could execute code is still stripped as defense-in-depth on top of
+  // the iframe sandbox:
+  //   - <script>...</script>
+  //   - on*="..."/on*='...' inline event handlers
+  //   - <iframe> (no proxied nested iframes)
+  //   - javascript: URLs in href/src
+  //   - <meta http-equiv="refresh"> (would otherwise silently redirect
+  //     the sandboxed iframe out from under the user)
   static sanitizeHTML(html) {
     let out = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
-    out = out.replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, '');
     out = out.replace(/\son\w+\s*=\s*"[^"]*"/gi, '');
     out = out.replace(/\son\w+\s*=\s*'[^']*'/gi, '');
     out = out.replace(/<iframe\b[^<]*(?:(?!<\/iframe>)<[^<]*)*<\/iframe>/gi, '');
-    if (out.length > 150000) out = out.slice(0, 150000) + '\n<!-- content truncated -->';
+    out = out.replace(/(\s(?:href|src))\s*=\s*(["'])\s*javascript:[^"']*\2/gi, '$1=$2#$2');
+    out = out.replace(/<meta[^>]+http-equiv=["']refresh["'][^>]*>/gi, '');
+    if (out.length > CONFIG.MAX_HTML_RETURNED) out = out.slice(0, CONFIG.MAX_HTML_RETURNED) + '\n<!-- content truncated -->';
     return out;
   }
 }
@@ -240,6 +340,12 @@ async function handler(req, res) {
 
   if (!['POST', 'GET'].includes(req.method)) {
     ResponseWriter.sendError(res, 'Method not allowed', 405);
+    return;
+  }
+
+  const clientId = req.headers['x-client-id'] || req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown';
+  if (!rateLimiter.isAllowed(clientId)) {
+    ResponseWriter.sendError(res, `Too many requests. Max ${CONFIG.REQUESTS_PER_MINUTE} per minute — please wait a moment.`, 429);
     return;
   }
 
@@ -279,10 +385,13 @@ async function handler(req, res) {
 
     let metadata = null;
     let content = fetched.content;
-    if (fetched.contentType.includes('text/html')) {
+    const isHtml = fetched.contentType.includes('text/html');
+    const isText = fetched.contentType.includes('text/') || fetched.contentType.includes('xml') || fetched.contentType.includes('json');
+
+    if (isHtml) {
       metadata = ContentProcessor.extractMetadata(content, fetched.url);
       content = ContentProcessor.sanitizeHTML(content);
-    } else if (!fetched.contentType.includes('text/')) {
+    } else if (!isText) {
       // Binary content isn't useful to render as text; keep the response small.
       content = `[Binary content: ${fetched.contentType || 'unknown type'}]`;
     }
@@ -290,6 +399,7 @@ async function handler(req, res) {
     const responseData = {
       url: fetched.url,
       contentType: fetched.contentType,
+      charset: fetched.charset,
       status: fetched.status,
       size: content.length,
       content,
@@ -300,7 +410,7 @@ async function handler(req, res) {
 
     cache.set(cacheKey, responseData);
     ResponseWriter.sendSuccess(res, responseData);
-    Logger.info('Proxy success', { url: targetURL, size: content.length, contentType: fetched.contentType });
+    Logger.info('Proxy success', { url: targetURL, size: content.length, contentType: fetched.contentType, charset: fetched.charset });
   } catch (error) {
     Logger.error('Proxy error', { error: error.message });
     ResponseWriter.sendError(res, error.message, 500);
